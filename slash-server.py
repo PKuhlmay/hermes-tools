@@ -1,78 +1,135 @@
 #!/usr/bin/env python3
-"""Minimal HTTP server for Rocket.Chat slash-commands /todos and /ideen."""
+"""Minimal HTTP server for Rocket.Chat slash-commands /todos and /ideen.
+
+Queries Notion databases instead of local markdown files.
+"""
 
 import json
 import os
 import re
+import subprocess
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 HERMES_HOME = os.path.expanduser("/opt/data")
-TODOS_PATH = os.path.join(HERMES_HOME, "todos.md")
-IDEAS_PATH = os.path.join(HERMES_HOME, "ideas.md")
 PORT = int(os.environ.get("SLASH_PORT", "8765"))
 
+NOTION_API_KEY = None
+TODOS_DB_ID = "3c0afcfa-468d-81a6-8c14-c5d453393e46"
+IDEEN_DB_ID = "3c0afcfa-468d-816e-9e6e-d8183bdcf8bb"
 
-def read_file(path):
-    """Read a file and return (exists, content_or_error)."""
-    if not os.path.isfile(path):
-        return False, "Datei nicht gefunden."
+
+def load_notion_key():
+    """Load NOTION_API_KEY from .env file."""
+    global NOTION_API_KEY
+    if NOTION_API_KEY:
+        return True
+    env_path = os.path.join(HERMES_HOME, ".env")
     try:
-        with open(path, "r", encoding="utf-8") as fh:
-            return True, fh.read()
+        with open(env_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("NOTION_API_KEY="):
+                    NOTION_API_KEY = line.split("=", 1)[1].strip("'\"")
+                    return True
+    except Exception:
+        pass
+    return False
+
+
+def notion_query(database_id, filter_dict=None, sorts=None):
+    """Query a Notion database and return parsed results."""
+    if not load_notion_key():
+        return {"success": False, "error": "NOTION_API_KEY nicht gefunden."}
+
+    payload = {}
+    if filter_dict:
+        payload["filter"] = filter_dict
+    if sorts:
+        payload["sorts"] = sorts
+
+    try:
+        import urllib.request
+
+        url = f"https://api.notion.com/v1/databases/{database_id}/query"
+        headers = {
+            "Authorization": f"Bearer {NOTION_API_KEY}",
+            "Notion-Version": "2022-06-28",
+            "Content-Type": "application/json",
+        }
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers=headers,
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        return {"success": True, "data": data}
     except Exception as e:
-        return False, f"Fehler beim Lesen: {e}"
+        return {"success": False, "error": str(e)}
 
 
-def render_todos(markdown):
-    """Parse a simple markdown TODO list into a compact formatted string."""
-    lines = markdown.splitlines()
-    sections = {}
-    current_section = "Allgemein"
-    for line in lines:
-        stripped = line.strip()
-        if stripped.startswith("## "):
-            current_section = stripped.lstrip("# ")
-        elif stripped.startswith("- [ ]"):
-            task = re.sub(r"^- \[.\] ", "", stripped).strip()
-            sections.setdefault(current_section, []).append(("offen", task))
-        elif stripped.startswith("- [x]"):
-            task = re.sub(r"^- \[.\] ", "", stripped).strip()
-            sections.setdefault(current_section, []).append(("erledigt", task))
-    if not sections:
-        return "📋 *Todos*\n\nKeine Einträge gefunden."
+def fetch_todos():
+    """Fetch open todos from Notion, sorted by priority descending."""
+    result = notion_query(
+        TODOS_DB_ID,
+        filter_dict={"property": "Status", "select": {"equals": "Offen"}},
+        sorts=[{"property": "Priorität", "direction": "descending"}],
+    )
+    if not result["success"]:
+        return f"❌ Fehler: {result['error']}"
 
-    out = ["📋 *Todos*\n"]
-    for section, items in sections.items():
-        if section == "Erledigt":
-            continue
-        out.append(f"*{section}:*")
-        for status, task in items:
-            icon = "☐" if status == "offen" else "☑"
-            out.append(f"  {icon} {task}")
-        out.append("")
-    # Erledigte ganz unten
-    if "Erledigt" in sections:
-        out.append(f"*Erledigt:*")
-        for status, task in sections["Erledigt"]:
-            out.append(f"  ☑ {task}")
+    results = result["data"].get("results", [])
+    if not results:
+        return "📋 *Todos*\n\nKeine offenen Todos. 🎉"
+
+    out = ["📋 *Offene Todos*\n"]
+    for r in results:
+        props = r.get("properties", {})
+        name = (
+            props.get("Name", {})
+            .get("title", [{}])[0]
+            .get("text", {})
+            .get("content", "Unbenannt")
+        )
+        prio = props.get("Priorität", {}).get("select")
+        prio_name = prio.get("name", "Ohne") if prio else "Ohne"
+
+        icons = {"Hoch": "🔥", "Mittel": "📊", "Niedrig": "💭", "Ohne": "☐"}
+        icon = icons.get(prio_name, "☐")
+        out.append(f"  {icon} **{prio_name}** — {name}")
+
     return "\n".join(out)
 
 
-def render_ideas(markdown):
-    """Parse the ideas file into a compact format."""
-    lines = markdown.splitlines()
-    out = ["💡 *Ideen*"]
-    current_section = ""
-    for line in lines:
-        stripped = line.strip()
-        if stripped.startswith("## "):
-            current_section = stripped.lstrip("# ")
-        elif stripped.startswith("- [ ]"):
-            idea = re.sub(r"^- \[.\] ", "", stripped).strip()
-            out.append(f"  💭 {idea}")
-        elif stripped.startswith("- [x]"):
-            idea = re.sub(r"^- \[.\] ", "", stripped).strip()
-            out.append(f"  ✅ {idea}")
+def fetch_ideas():
+    """Fetch open ideas from Notion."""
+    result = notion_query(
+        IDEEN_DB_ID,
+        filter_dict={"property": "Status", "select": {"equals": "Offen"}},
+        sorts=[{"property": "Status", "direction": "ascending"}],
+    )
+    if not result["success"]:
+        return f"❌ Fehler: {result['error']}"
+
+    results = result["data"].get("results", [])
+    if not results:
+        return "💡 *Ideen*\n\nKeine offenen Ideen. 💭"
+
+    out = ["💡 *Offene Ideen*\n"]
+    for r in results:
+        props = r.get("properties", {})
+        name = (
+            props.get("Name", {})
+            .get("title", [{}])[0]
+            .get("text", {})
+            .get("content", "Unbenannt")
+        )
+        kategorie = props.get("Kategorie", {}).get("select")
+        kat_name = kategorie.get("name", "") if kategorie else ""
+        kat_tag = f" `[{kat_name}]`" if kat_name else ""
+        out.append(f"  💭 {name}{kat_tag}")
+
     return "\n".join(out)
 
 
@@ -81,19 +138,11 @@ class SlashHandler(BaseHTTPRequestHandler):
         path = self.path.rstrip("/")
 
         if path == "/todos":
-            exists, content = read_file(TODOS_PATH)
-            if not exists:
-                self._respond(content)
-            else:
-                self._respond(render_todos(content))
+            self._respond(fetch_todos())
         elif path == "/ideen":
-            exists, content = read_file(IDEAS_PATH)
-            if not exists:
-                self._respond(content)
-            else:
-                self._respond(render_ideas(content))
+            self._respond(fetch_ideas())
         elif path == "/health":
-            self._respond("🤖 Slash-Server läuft!", status=200)
+            self._respond("🤖 Slash-Server läuft! (Notion-Anbindung aktiv)")
         else:
             self._respond(f"Unbekannter Befehl: {path}", status=404)
 
@@ -101,7 +150,6 @@ class SlashHandler(BaseHTTPRequestHandler):
         self.do_POST()
 
     def _respond(self, text, status=200):
-        """Send response in Rocket.Chat slash-command format."""
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.end_headers()
@@ -113,6 +161,12 @@ class SlashHandler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    # Quick test on startup
+    if load_notion_key():
+        print(f"[SlashServer] NOTION_API_KEY geladen (endet auf ...{NOTION_API_KEY[-4:]})")
+    else:
+        print("[SlashServer] WARNUNG: NOTION_API_KEY nicht gefunden!")
+
     server = HTTPServer(("0.0.0.0", PORT), SlashHandler)
     print(f"[SlashServer] Listening on http://0.0.0.0:{PORT}")
     print(f"[SlashServer] Endpoints: /todos  /ideen  /health")
