@@ -60,12 +60,14 @@ class BriefingHandler(BaseHTTPRequestHandler):
             self.send_json(HTTPStatus.OK, {"status": "ok"})
             return
 
-        match = re.fullmatch(r"/brief/([A-Za-z0-9_-]{32,128})", path)
+        match = re.fullmatch(r"/(brief|design)/([A-Za-z0-9_-]{32,128})", path)
         if not match:
             self.send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
             return
 
-        page = DATA_DIR / f"{match.group(1)}.html"
+        kind, token = match.groups()
+        prefix = "design-" if kind == "design" else ""
+        page = DATA_DIR / f"{prefix}{token}.html"
         if not page.is_file():
             self.send_json(HTTPStatus.NOT_FOUND, {"error": "briefing not found"})
             return
@@ -84,10 +86,12 @@ class BriefingHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         path = urlparse(self.path).path
-        match = re.fullmatch(r"/api/publish/([A-Za-z0-9_-]{32,128})", path)
+        match = re.fullmatch(r"/api/(publish|design)/([A-Za-z0-9_-]{32,128})", path)
         if not match:
             self.send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
             return
+
+        kind, token = match.groups()
 
         try:
             length = int(self.headers.get("Content-Length", "0"))
@@ -108,13 +112,14 @@ class BriefingHandler(BaseHTTPRequestHandler):
             self.send_json(HTTPStatus.BAD_REQUEST, {"error": "expected a complete HTML document"})
             return
 
-        token = match.group(1)
-        write_atomic(DATA_DIR / f"{token}.html", document)
-        self._prune_old_pages(keep=3)
-        self.send_json(HTTPStatus.CREATED, {"path": f"/brief/{token}"})
+        prefix = "design-" if kind == "design" else ""
+        write_atomic(DATA_DIR / f"{prefix}{token}.html", document)
+        if kind == "publish":
+            self._prune_old_pages(keep=3)
+        self.send_json(HTTPStatus.CREATED, {"path": f"/{'design' if kind == 'design' else 'brief'}/{token}"})
 
     def _prune_old_pages(self, keep: int) -> None:
-        pages = sorted(DATA_DIR.glob("*.html"), key=lambda item: item.stat().st_mtime, reverse=True)
+        pages = sorted((page for page in DATA_DIR.glob("*.html") if not page.name.startswith("design-")), key=lambda item: item.stat().st_mtime, reverse=True)
         for stale_page in pages[keep:]:
             stale_page.unlink(missing_ok=True)
 
