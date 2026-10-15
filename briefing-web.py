@@ -43,7 +43,16 @@ class BriefingHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
-        self.wfile.write(body)
+        if not getattr(self, "_head_only", False):
+            self.wfile.write(body)
+
+    def do_HEAD(self) -> None:  # noqa: N802
+        """Return the same headers as GET without a response body."""
+        self._head_only = True
+        try:
+            self.do_GET()
+        finally:
+            del self._head_only
 
     def do_GET(self) -> None:  # noqa: N802
         path = urlparse(self.path).path
@@ -70,7 +79,8 @@ class BriefingHandler(BaseHTTPRequestHandler):
         self.send_header("X-Robots-Tag", "noindex, nofollow, noarchive")
         self.send_header("Referrer-Policy", "no-referrer")
         self.end_headers()
-        self.wfile.write(body)
+        if not getattr(self, "_head_only", False):
+            self.wfile.write(body)
 
     def do_POST(self) -> None:  # noqa: N802
         path = urlparse(self.path).path
